@@ -1,118 +1,265 @@
-mod chat;
-mod message;
-mod store;
+use rusqlite::{params, Connection, Result, Row};
+use std::io::{self, BufRead, Write};
+use std::sync::mpsc;
+use std::thread;
 
-use std::collections::HashSet;
+/// One row of chat history.
+#[derive(Debug)]
+struct Message {
+    user_id: String,
+    message: String,
+    sent_at: String,
+}
 
-use tokio::sync::{mpsc, oneshot};
+fn row_to_message(row: &Row) -> Result<Message> {
+    Ok(Message {
+        user_id: row.get(0)?,
+        message: row.get(1)?,
+        sent_at: row.get(2)?,
+    })
+}
 
-use chat::{run_handler, send_as_user, ChatCommand};
-use message::MessageType;
+fn init_db(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS messages (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id   TEXT NOT NULL,
+            message   TEXT NOT NULL,
+            sent_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
+        )",
+        [],
+    )?;
+    Ok(())
+}
 
-#[tokio::main]
-async fn main() {
-    let known_users: HashSet<String> = ["alice", "bob", "carol"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+/// `message: None` is accepted on purpose — it violates the NOT NULL column
+/// and lets the demo show a real rusqlite error flowing back as a `Result`,
+/// rather than a hand-rolled validation error.
+fn save_message(conn: &Connection, user_id: &str, message: Option<&str>) -> Result<()> {
+    conn.execute(
+        "INSERT INTO messages (user_id, message) VALUES (?1, ?2)",
+        params![user_id, message],
+    )?;
+    Ok(())
+}
 
-    let (tx, rx) = mpsc::channel(32);
-    let handler = tokio::spawn(run_handler(rx, known_users));
+fn history(conn: &Connection) -> Result<Vec<Message>> {
+    let mut stmt = conn.prepare("SELECT user_id, message, sent_at FROM messages ORDER BY id")?;
+    let rows = stmt.query_map([], row_to_message)?.collect();
+    rows
+}
+
+fn filter_by_user(conn: &Connection, user_id: &str) -> Result<Vec<Message>> {
+    let mut stmt = conn.prepare(
+        "SELECT user_id, message, sent_at FROM messages WHERE user_id = ?1 ORDER BY id",
+    )?;
+    let rows = stmt.query_map(params![user_id], row_to_message)?.collect();
+    rows
+}
+
+fn search_by_keyword(conn: &Connection, keyword: &str) -> Result<Vec<Message>> {
+    let pattern = format!("%{}%", keyword.to_lowercase());
+    let mut stmt = conn.prepare(
+        "SELECT user_id, message, sent_at FROM messages WHERE LOWER(message) LIKE ?1 ORDER BY id",
+    )?;
+    let rows = stmt.query_map(params![pattern], row_to_message)?.collect();
+    rows
+}
+
+fn print_query(label: &str, result: Result<Vec<Message>>) {
+    println!("\n-- {} --", label);
+    match result {
+        Ok(messages) if messages.is_empty() => println!("No messages found."),
+        Ok(messages) => {
+            for m in messages {
+                println!("[{}] {}: {}", m.sent_at, m.user_id, m.message);
+            }
+        }
+        Err(e) => println!("Error: {}", e),
+    }
+}
+
+/// Everything the handler thread can be asked to do. `Save` comes from the
+/// simulated user threads; `History`/`Filter`/`Search` come from the
+/// interactive CLI on the main thread and carry a one-shot reply channel
+/// (plain `std::sync::mpsc`, used once per request) so the caller can block
+/// on the answer.
+enum Command {
+    Save {
+        user_id: String,
+        message: Option<String>,
+    },
+    History {
+        reply: mpsc::Sender<Result<Vec<Message>>>,
+    },
+    Filter {
+        user_id: String,
+        reply: mpsc::Sender<Result<Vec<Message>>>,
+    },
+    Search {
+        keyword: String,
+        reply: mpsc::Sender<Result<Vec<Message>>>,
+    },
+    Shutdown,
+}
+
+/// The handler owns the only `rusqlite::Connection` for the program's whole
+/// lifetime. That's not just tidy design: SQLite allows only one writer at a
+/// time, so if several threads opened their own connection and wrote
+/// directly, some inserts would fail with "database is locked." Funneling
+/// every save AND every query through one thread's connection sidesteps
+/// that entirely — there is never more than one writer, by construction.
+fn run_handler(rx: mpsc::Receiver<Command>) {
+    let conn = Connection::open_in_memory().expect("failed to open in-memory database");
+    init_db(&conn).expect("failed to create messages table");
+
+    for cmd in rx {
+        match cmd {
+            Command::Save { user_id, message } => match save_message(&conn, &user_id, message.as_deref()) {
+                Ok(()) => println!(
+                    "saved: {} -> {}",
+                    user_id,
+                    message.as_deref().unwrap_or("")
+                ),
+                Err(e) => println!("Error saving message from {}: {}", user_id, e),
+            },
+            Command::History { reply } => {
+                let _ = reply.send(history(&conn));
+            }
+            Command::Filter { user_id, reply } => {
+                let _ = reply.send(filter_by_user(&conn, &user_id));
+            }
+            Command::Search { keyword, reply } => {
+                let _ = reply.send(search_by_keyword(&conn, &keyword));
+            }
+            Command::Shutdown => break,
+        }
+    }
+}
+
+fn simulate_user(tx: mpsc::Sender<Command>, user_id: &str, messages: Vec<Option<&str>>) {
+    for message in messages {
+        let _ = tx.send(Command::Save {
+            user_id: user_id.to_string(),
+            message: message.map(str::to_string),
+        });
+    }
+}
+
+/// Sends a query command with a fresh one-shot reply channel and blocks for
+/// the handler's answer. If the handler is somehow gone, that's treated as
+/// "no results" rather than a panic — the CLI should never crash under the
+/// user just because a query raced shutdown.
+fn query_blocking(
+    tx: &mpsc::Sender<Command>,
+    make_cmd: impl FnOnce(mpsc::Sender<Result<Vec<Message>>>) -> Command,
+) -> Result<Vec<Message>> {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let _ = tx.send(make_cmd(reply_tx));
+    reply_rx.recv().unwrap_or_else(|_| Ok(Vec::new()))
+}
+
+fn print_help() {
+    println!(
+        "commands:\n  history            show every saved message\n  filter <user>      show messages from one user\n  search <keyword>   show messages containing a keyword\n  help               show this list\n  quit | exit        stop the program"
+    );
+}
+
+fn print_prompt() {
+    print!("> ");
+    let _ = io::stdout().flush();
+}
+
+/// The CLI loop that keeps the program "alive until interrupted": it blocks
+/// on stdin and answers queries against the live database until the user
+/// types `quit`/`exit`, pipes EOF, or hits Ctrl+C.
+fn run_cli(tx: &mpsc::Sender<Command>) {
+    print_prompt();
+    for line in io::stdin().lock().lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            print_prompt();
+            continue;
+        }
+
+        let mut parts = line.splitn(2, ' ');
+        let command = parts.next().unwrap_or("");
+        let arg = parts.next().unwrap_or("").trim();
+
+        match command {
+            "history" => print_query("full history", query_blocking(tx, |reply| Command::History { reply })),
+            "filter" if !arg.is_empty() => print_query(
+                &format!("messages from {}", arg),
+                query_blocking(tx, |reply| Command::Filter {
+                    user_id: arg.to_string(),
+                    reply,
+                }),
+            ),
+            "search" if !arg.is_empty() => print_query(
+                &format!("keyword search: '{}'", arg),
+                query_blocking(tx, |reply| Command::Search {
+                    keyword: arg.to_string(),
+                    reply,
+                }),
+            ),
+            "filter" => println!("usage: filter <user>"),
+            "search" => println!("usage: search <keyword>"),
+            "help" => print_help(),
+            "quit" | "exit" => break,
+            other => println!("unknown command: '{}' (type 'help' for the list)", other),
+        }
+        print_prompt();
+    }
+    println!();
+}
+
+fn main() {
+    let (tx, rx) = mpsc::channel::<Command>();
+    let handler = thread::spawn(move || run_handler(rx));
 
     println!("-- sending messages --");
 
-    // Several simulated users send concurrently, including two error cases:
-    // an unknown recipient and an empty message.
-    let sends = vec![
-        tokio::spawn(send_as_user(
-            tx.clone(),
+    let seed: Vec<(&str, Vec<Option<&str>>)> = vec![
+        (
             "alice",
-            MessageType::Direct {
-                recipient: "bob".to_string(),
-            },
-            "hey bob, are we still on for rust tonight?",
-        )),
-        tokio::spawn(send_as_user(
-            tx.clone(),
+            vec![
+                Some("hey everyone, are we still on for rust tonight?"),
+                Some("see you all at 7"),
+            ],
+        ),
+        (
             "bob",
-            MessageType::Direct {
-                recipient: "alice".to_string(),
-            },
-            "yep, see you at 7",
-        )),
-        tokio::spawn(send_as_user(
-            tx.clone(),
-            "carol",
-            MessageType::Broadcast,
-            "reminder: demo freeze is tonight",
-        )),
-        tokio::spawn(send_as_user(
-            tx.clone(),
-            "alice",
-            MessageType::Direct {
-                recipient: "dave".to_string(), // unknown user -> expect an error
-            },
-            "is dave around?",
-        )),
-        tokio::spawn(send_as_user(
-            tx.clone(),
-            "bob",
-            MessageType::Broadcast,
-            "", // empty message -> expect an error
-        )),
+            vec![
+                Some("yep, I'll be there"),
+                None, // deliberately bad: violates the NOT NULL message column
+            ],
+        ),
+        ("carol", vec![Some("reminder: demo freeze is tonight")]),
     ];
 
-    for send in sends {
-        let _ = send.await;
+    let senders: Vec<_> = seed
+        .into_iter()
+        .map(|(user_id, messages)| {
+            let tx = tx.clone();
+            thread::spawn(move || simulate_user(tx, user_id, messages))
+        })
+        .collect();
+
+    for handle in senders {
+        handle.join().expect("a user thread panicked");
     }
 
-    println!("\n-- messages from alice --");
-    print_filter_by_user(&tx, "alice").await;
+    println!("\nInitial messages sent. Type 'help' for commands, 'quit' to stop.");
+    run_cli(&tx);
 
-    println!("\n-- messages from an unknown user --");
-    print_filter_by_user(&tx, "dave").await;
-
-    println!("\n-- keyword search: 'rust' --");
-    print_search_keyword(&tx, "rust").await;
-
-    println!("\n-- keyword search with no matches: 'golang' --");
-    print_search_keyword(&tx, "golang").await;
-
-    let _ = tx.send(ChatCommand::Shutdown).await;
+    let _ = tx.send(Command::Shutdown);
+    // Drop main's own Sender so the channel closes if Shutdown didn't already
+    // break the handler's loop (e.g. stdin hit EOF before `quit`).
     drop(tx);
-    let _ = handler.await;
-}
 
-async fn print_filter_by_user(tx: &mpsc::Sender<ChatCommand>, user: &str) {
-    let (resp_tx, resp_rx) = oneshot::channel();
-    let _ = tx
-        .send(ChatCommand::FilterByUser {
-            user: user.to_string(),
-            respond_to: resp_tx,
-        })
-        .await;
-    print_lines(resp_rx.await);
-}
-
-async fn print_search_keyword(tx: &mpsc::Sender<ChatCommand>, keyword: &str) {
-    let (resp_tx, resp_rx) = oneshot::channel();
-    let _ = tx
-        .send(ChatCommand::SearchKeyword {
-            keyword: keyword.to_string(),
-            respond_to: resp_tx,
-        })
-        .await;
-    print_lines(resp_rx.await);
-}
-
-fn print_lines(result: Result<Result<Vec<String>, message::ChatError>, oneshot::error::RecvError>) {
-    match result {
-        Ok(Ok(lines)) => {
-            for line in lines {
-                println!("{}", line);
-            }
-        }
-        Ok(Err(e)) => println!("Error: {}", e),
-        Err(_) => println!("Error: no response from chat handler"),
-    }
+    handler.join().expect("handler thread panicked");
 }

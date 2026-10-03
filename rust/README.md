@@ -1,50 +1,67 @@
 # Simple Chat Application — Rust
 
-Rust implementation for MSCS-632 Deliverable: simulated multi-user chat, no
-network and no GUI. See the project-level planning doc for the shared spec.
+Rust implementation for MSCS-632 Deliverable: a shared chat room with
+simulated users, backed by SQLite, with a live command loop. No network and
+no GUI.
 
 ## Features
 
-- Simulated users (`alice`, `bob`, `carol`) created at startup.
-- Users send a message to one other user (`MessageType::Direct`) or to
-  everyone (`MessageType::Broadcast`); several users send concurrently as
-  tokio tasks.
-- Every message is timestamped and stored in memory with sender, recipient,
-  and text.
-- Filter history by sender.
-- Case-insensitive keyword search over message text.
-- Errors (unknown recipient, empty message, no search/filter results) print
-  a clear message instead of panicking.
+- Three simulated users (`alice`, `bob`, `carol`) created at startup.
+- Each user posts a few messages into the shared room concurrently, on its
+  own OS thread.
+- Every message is saved to a SQLite `messages` table (`user_id`, `message`,
+  `sent_at`).
+- After the initial burst of messages, the program enters an interactive
+  command loop and stays alive until you stop it:
+  - `history` — show every saved message
+  - `filter <user>` — show messages from one user
+  - `search <keyword>` — show messages containing a keyword
+  - `help` — list commands
+  - `quit` / `exit` — stop the program (Ctrl+C / Ctrl+D also work)
+- A no-match filter or search prints "No messages found." instead of an
+  empty, ambiguous list.
+- A deliberately invalid send (a `NULL` message body, from `bob`) demonstrates
+  a real `rusqlite` error flowing back as a `Result` the caller must handle.
 
 ## Structure
 
-- `src/message.rs` — `Message` struct, `MessageType` enum, `ChatError` enum.
-- `src/store.rs` — `MessageStore`: history, filter, search.
-- `src/chat.rs` — the async handler task and channel-based commands.
-- `src/main.rs` — demo scenario.
+Everything lives in `src/main.rs`: the `Message` struct, the SQLite
+functions (`init_db`, `save_message`, `history`, `filter_by_user`,
+`search_by_keyword`), the `Command` enum and handler thread, and the
+interactive loop in `main()`/`run_cli()`.
 
 ## Design
 
-A single handler task owns the `MessageStore`. Every simulated user task
-only holds a `Sender<ChatCommand>` and talks to the handler over a `tokio`
-mpsc channel, using a `oneshot` channel per request to get a response back.
-This keeps the history behind one owner, so the borrow checker never has to
-reason about shared mutable state across tasks.
+The handler thread owns the only `rusqlite::Connection` for the program's
+entire lifetime. Simulated users (and the CLI) never touch the database
+directly — they only hold a `Sender<Command>` and talk to the handler over a
+`std::sync::mpsc` channel, with a fresh one-shot reply channel per query.
+This isn't just a style choice:
+
+- `rusqlite::Connection` isn't `Sync`, so a single owner is the only way the
+  compiler allows the database to be shared across threads at all.
+- SQLite itself only allows one writer at a time — if several threads opened
+  their own connection and wrote directly, concurrent inserts could fail
+  with "database is locked." Funneling every save *and* every query through
+  one thread's connection means there is never more than one writer, by
+  construction, not by convention.
+
+`main` spawns the handler, spawns one thread per simulated user, joins them,
+then hands control to `run_cli()` on the main thread, which blocks on stdin
+and answers `history`/`filter`/`search` against the live database until
+`quit`, EOF, or Ctrl+C.
 
 ## Build & run
 
-Requires Rust (stable) via [rustup](https://rustup.rs/).
+Requires Rust (stable) via [rustup](https://rustup.rs/) and a C compiler
+(`cc`/`clang`) for the bundled SQLite.
 
 ```sh
-cargo run
+cargo run --quiet
 ```
-
-Run the test-free demo scenario above; it sends several messages
-concurrently (including two deliberately invalid ones), then filters by
-user and searches by keyword, including a no-match case.
 
 ## Dependencies
 
-- `tokio` (async runtime, channels) — Go gets goroutines/channels for free;
-  Rust needs this crate.
-- `chrono` (timestamps) — same story, Go's `time` package is built in.
+- `rusqlite` (with the `bundled` feature, so it builds its own SQLite and
+  doesn't need a system `libsqlite3`) — Go's equivalent is `database/sql`
+  plus a SQLite driver package.
